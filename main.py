@@ -92,10 +92,11 @@ def fetch_player_js(player_js_url: str) -> str:
 def extract_webpack_modules(player_js: str) -> Dict[str, Any]:
     # Use Node.js to extract webpack modules
     script = """
+    const fs = require("fs");
     const { parse } = require("meriyah");
     const { traverse } = require("estraverse");
     
-    const playerJs = JSON.parse(process.argv[1]);
+    const playerJs = fs.readFileSync(0, "utf-8");
     const ast = parse(playerJs, { ranges: true });
     
     let wpm = null;
@@ -117,19 +118,18 @@ def extract_webpack_modules(player_js: str) -> Dict[str, Any]:
     
     if (!wpm) throw new Error("could not find __webpack_modules__");
     
-    // Extract the string representation of the webpack modules
     const wpmString = playerJs.substring(wpm.start, wpm.end);
     console.log(JSON.stringify({ wpmString, start: wpm.start, end: wpm.end }));
     """
     
     try:
         result = subprocess.run(
-            ["node", "-e", script, json.dumps(player_js)],
+            ["node", "-e", script],
+            input=player_js,
             capture_output=True,
             text=True,
             check=True
         )
-        # Parse the JSON output from the Node.js script
         return json.loads(result.stdout.strip())
     except subprocess.CalledProcessError as e:
         print(f"Error extracting webpack modules: {e.stderr}")
@@ -141,9 +141,10 @@ def extract_webpack_modules(player_js: str) -> Dict[str, Any]:
 def find_otp_module(player_js: str, wpm_info: Dict[str, Any]) -> List[Candidate]:
     # Use Node.js to find OTP modules
     script = """
+    const fs = require("fs");
     const { parse } = require("meriyah");
     
-    const playerJs = JSON.parse(process.argv[1]);
+    const playerJs = fs.readFileSync(0, "utf-8");
     const wpmInfo = JSON.parse(process.argv[2]);
     
     const searchPatterns = [
@@ -155,11 +156,9 @@ def find_otp_module(player_js: str, wpm_info: Dict[str, Any]) -> List[Candidate]
     
     const candidates = [];
     
-    // Parse the webpack modules object
     const wpmString = wpmInfo.wpmString;
     const ast = parse("const __webpack_modules__ = " + wpmString, { ranges: true });
     
-    // Extract the webpack modules object from the AST
     const wpmNode = ast.body[0].declarations[0].init;
     
     wpmNode.properties.forEach((p) => {
@@ -187,7 +186,8 @@ def find_otp_module(player_js: str, wpm_info: Dict[str, Any]) -> List[Candidate]
     
     try:
         result = subprocess.run(
-            ["node", "-e", script, json.dumps(player_js), json.dumps(wpm_info)],
+            ["node", "-e", script, "-", json.dumps(wpm_info)],
+            input=player_js,
             capture_output=True,
             text=True,
             check=True
@@ -209,22 +209,23 @@ def build_eval_script(wpm_str: str, otp_candidates: List[Candidate]) -> str:
 
 def run_eval_script(eval_script: str) -> SpotifySecrets:
     # Use Node.js to run the evaluation script
-    script = f"""
-    const evalScript = JSON.parse(process.argv[1]);
+    script = """
+    const fs = require("fs");
+    const evalScript = fs.readFileSync(0, "utf-8");
     const result = eval(evalScript);
     console.log(JSON.stringify(result));
     """
     
     try:
         result = subprocess.run(
-            ["node", "-e", script, json.dumps(eval_script)],
+            ["node", "-e", script],
+            input=eval_script,
             capture_output=True,
             text=True,
             check=True
         )
         secrets = json.loads(result.stdout.strip())
         
-        # Validate the output
         if not secrets or not isinstance(secrets, list):
             raise ValueError("Invalid secrets format")
         
@@ -236,7 +237,6 @@ def run_eval_script(eval_script: str) -> SpotifySecrets:
             if not isinstance(item["version"], int) or item["version"] <= 0:
                 raise ValueError("Invalid version value")
         
-        # Sort by version
         secrets.sort(key=lambda x: x["version"])
         return secrets
     except subprocess.CalledProcessError as e:
@@ -259,18 +259,15 @@ def secrets_to_dict(secrets: SpotifySecrets) -> SpotifySecretDict:
     }
 
 def main():
-    # Create directories if they don't exist
     os.makedirs("tmp", exist_ok=True)
     os.makedirs("secrets", exist_ok=True)
     
     player_js = None
     
     if len(sys.argv) > 1:
-        # Read from file if provided
         with open(sys.argv[1], "r") as f:
             player_js = f.read()
     else:
-        # Fetch from Spotify
         player_js_url = fetch_player_js_url()
         print(f"Player JS URL: {player_js_url}", file=sys.stderr)
         
@@ -289,22 +286,17 @@ def main():
         with open("tmp/playerUrl.txt", "w") as f:
             f.write(player_js_url)
     
-    # Extract webpack modules
     wpm_info = extract_webpack_modules(player_js)
     wpm_str = f"const __webpack_modules__ = {wpm_info['wpmString']}"
     
-    # Find OTP modules
     otp_candidates = find_otp_module(player_js, wpm_info)
     
-    # Build and run evaluation script
     eval_script = build_eval_script(wpm_str, otp_candidates)
     spotify_secrets = run_eval_script(eval_script)
     
-    # Convert to different formats
     spotify_secret_bytes = secrets_to_bytes(spotify_secrets)
     spotify_secret_dict = secrets_to_dict(spotify_secrets)
     
-    # Print and save results
     print(json.dumps(spotify_secrets, indent=2))
     
     with open("secrets/secrets.json", "w") as f:
