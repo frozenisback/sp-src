@@ -89,54 +89,172 @@ def fetch_player_js(player_js_url: str) -> str:
         raise Exception(f"Invalid content type: {ct}")
     return response.text
 
-def extract_webpack_modules(player_js: str) -> Dict[str, Any]:
-    # Use Node.js to extract webpack modules
-    script = """
-    const fs = require("fs");
-    const { parse } = require("meriyah");
-    const { traverse } = require("estraverse");
-    
-    const playerJs = fs.readFileSync(0, "utf-8");
-    const ast = parse(playerJs, { ranges: true });
-    
-    let wpm = null;
-    
-    traverse(ast, {
-      enter: (node) => {
-        if (node.type === "VariableDeclaration") {
-          const found = node.declarations.find(
-            (d) => d.id.type === "Identifier" && d.id.name === "__webpack_modules__"
-          );
-          if (found?.init && found.init.type === "ObjectExpression") {
-            wpm = found.init;
-            console.error("__webpack_modules__ found at", found.init.range);
-            return traverse.VisitorOption.Break;
-          }
-        }
-      },
-    });
-    
-    if (!wpm) throw new Error("could not find __webpack_modules__");
-    
-    const wpmString = playerJs.substring(wpm.start, wpm.end);
-    console.log(JSON.stringify({ wpmString, start: wpm.start, end: wpm.end }));
+def _find_matching_brace(js: str, start_idx: int) -> int:
     """
-    
-    try:
-        result = subprocess.run(
-            ["node", "-e", script],
-            input=player_js,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        return json.loads(result.stdout.strip())
-    except subprocess.CalledProcessError as e:
-        print(f"Error extracting webpack modules: {e.stderr}")
-        raise Exception("could not find __webpack_modules__")
-    except json.JSONDecodeError as e:
-        print(f"Error parsing webpack modules output: {e}")
-        raise Exception("could not parse __webpack_modules__")
+    Given js string and index of an opening '{', return index of matching closing '}'.
+    This function is careful to skip braces inside single/double/backtick strings and comments.
+    """
+    i = start_idx
+    n = len(js)
+    if i >= n or js[i] != "{":
+        raise ValueError("start_idx must point to '{'")
+    depth = 0
+    in_single = False
+    in_double = False
+    in_backtick = False
+    in_regex = False
+    escape = False
+    i += 0
+    while i < n:
+        ch = js[i]
+        # Handle escape inside strings
+        if escape:
+            escape = False
+            i += 1
+            continue
+
+        # Handle string toggling
+        if in_single:
+            if ch == "\\":
+                escape = True
+            elif ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if in_backtick:
+            if ch == "\\":
+                escape = True
+            elif ch == "`":
+                in_backtick = False
+            i += 1
+            continue
+        # handle comments
+        if ch == "/":
+            # lookahead
+            nxt = js[i+1] if i+1 < n else ""
+            if nxt == "/":
+                # skip single-line comment
+                i += 2
+                while i < n and js[i] not in "\r\n":
+                    i += 1
+                continue
+            elif nxt == "*":
+                # skip multi-line comment
+                i += 2
+                while i+1 < n and not (js[i] == "*" and js[i+1] == "/"):
+                    i += 1
+                i += 2
+                continue
+            else:
+                # Could be a regex literal — naive handling: if previous non-space char suggests start of expression, skip until next '/'
+                # This is heuristic; we primarily care about strings/comments/braces, not perfect regex parsing.
+                # To avoid false positives we will not try to parse regex here.
+                pass
+
+        # Now handle normal chars
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        elif ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "`":
+            in_backtick = True
+
+        i += 1
+
+    raise ValueError("No matching closing brace found")
+
+def _extract_object_at(js: str, brace_open_idx: int) -> str:
+    end_idx = _find_matching_brace(js, brace_open_idx)
+    return js[brace_open_idx:end_idx+1]
+
+def extract_webpack_modules(player_js: str) -> Dict[str, Any]:
+    """
+    Robust extraction of the webpack modules object (or close equivalent) from Spotify's player.js.
+
+    This function returns a dict with keys:
+      - 'wpmString': the exact JavaScript source text representing the modules object
+      - 'start': starting index in the original player_js string (int)
+      - 'end': ending index in the original player_js string (int)
+    """
+    # Candidate regex patterns (ordered)
+    # 1) Explicit __webpack_modules__ assignment
+    patterns = [
+        r"__webpack_modules__\s*=\s*\{",             # __webpack_modules__ = {
+        r"var\s+[a-zA-Z0-9_$]+\s*=\s*\{",           # var a = {
+        r"let\s+[a-zA-Z0-9_$]+\s*=\s*\{",           # let a = {
+        r"[a-zA-Z0-9_$]+\s*=\s*\{",                 # a = {
+        # webpackBootstrap style: /******/ (() => { var __webpack_modules__ = ({ ... })
+        r"\/\*{6,}\s*\(\/\*{0,}\)\s*=>\s*\{\s*var\s+[a-zA-Z0-9_$]+\s*=\s*\(\{",
+        # look for a large object literal that looks like numeric keys: 0:{...},1:{...},...
+        r"\{\s*(?:\d+\s*:\s*function\b)"
+    ]
+
+    # Try to find using patterns and then extract balanced braces
+    for pat in patterns:
+        for m in re.finditer(pat, player_js):
+            # find the position of the first '{' after the match start
+            span_start = m.start()
+            # search for the next '{' from m.start()
+            open_brace_idx = player_js.find("{", m.start())
+            if open_brace_idx == -1:
+                continue
+            try:
+                obj_str = _extract_object_at(player_js, open_brace_idx)
+                return {"wpmString": obj_str, "start": open_brace_idx, "end": open_brace_idx + len(obj_str)}
+            except Exception:
+                # if matching fails, keep searching
+                continue
+
+    # Secondary heuristic: sometimes modules are wrapped like (t={123:function...})
+    # search for patterns like "=({<digits>:function"
+    heur = re.search(r"=\s*\(\s*\{[0-9]+\s*:\s*function", player_js)
+    if heur:
+        open_brace_idx = player_js.find("{", heur.start())
+        try:
+            obj_str = _extract_object_at(player_js, open_brace_idx)
+            return {"wpmString": obj_str, "start": open_brace_idx, "end": open_brace_idx + len(obj_str)}
+        except Exception:
+            pass
+
+    # Last resort: try to find the largest object-like literal in the file that contains "function"
+    # This is a fallback and not perfect but often finds the modules object when minified/unusual
+    largest_obj = None
+    for m in re.finditer(r"\{", player_js):
+        try:
+            obj = _extract_object_at(player_js, m.start())
+            # quick heuristic: object should be fairly large and contain "function" and numeric keys
+            if len(obj) > 2000 and "function" in obj:
+                if re.search(r"\d+\s*:", obj):
+                    largest_obj = (m.start(), obj)
+                    break
+                # accept if it contains many occurrences of "function"
+                if obj.count("function") >= 3:
+                    largest_obj = (m.start(), obj)
+                    break
+        except Exception:
+            continue
+
+    if largest_obj:
+        start_idx, obj_str = largest_obj
+        return {"wpmString": obj_str, "start": start_idx, "end": start_idx + len(obj_str)}
+
+    # If none worked, raise a clear exception with a short diagnostic
+    # include a short snippet around likely areas to help debugging
+    snippet = player_js[:2000] if len(player_js) > 2000 else player_js
+    raise Exception("could not find __webpack_modules__ (tried multiple heuristics). Sample start of file:\n" + snippet[:1000])
 
 def find_otp_module(player_js: str, wpm_info: Dict[str, Any]) -> List[Candidate]:
     # Use Node.js to find OTP modules
@@ -286,17 +404,22 @@ def main():
         with open("tmp/playerUrl.txt", "w") as f:
             f.write(player_js_url)
     
+    # Extract webpack modules
     wpm_info = extract_webpack_modules(player_js)
     wpm_str = f"const __webpack_modules__ = {wpm_info['wpmString']}"
     
+    # Find OTP modules
     otp_candidates = find_otp_module(player_js, wpm_info)
     
+    # Build and run evaluation script
     eval_script = build_eval_script(wpm_str, otp_candidates)
     spotify_secrets = run_eval_script(eval_script)
     
+    # Convert to different formats
     spotify_secret_bytes = secrets_to_bytes(spotify_secrets)
     spotify_secret_dict = secrets_to_dict(spotify_secrets)
     
+    # Print and save results
     print(json.dumps(spotify_secrets, indent=2))
     
     with open("secrets/secrets.json", "w") as f:
